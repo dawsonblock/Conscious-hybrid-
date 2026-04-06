@@ -1,25 +1,69 @@
-## Evaluation harnesses
+## Evaluation Harnesses
 
-The hybrid cognitive agent includes a handful of simple evaluation harnesses.  Each harness defines a scenario, runs the agent and measures outcome metrics.  These harnesses are intended as smoke tests rather than comprehensive benchmarks.
+The v5 evaluation layer is a deterministic harness suite rather than a benchmark runner. Each harness executes a small scenario and returns structured case results plus harness-specific metrics.
 
-### Coordination harness
+### Coordination
 
-This harness asks the agent to perform a two‑step workflow: echo a message and then store a note.  Metrics include task completion and number of unnecessary proposals.
+The coordination harness runs a greeting case and an approval-gated note-storage case. It checks:
 
-### Metacognition harness
+- selected action accuracy
+- completion rate
+- approval resume rate for write-side effects
+- whether module proposals and recurrent passes were emitted
 
-Here a fake contradiction is injected into the workspace.  The harness checks whether the meta monitor detects the contradiction and issues an appropriate control signal.
+### Metacognition
 
-### Memory harness
+The metacognition harness feeds the monitor four explicit scenarios:
 
-This harness writes a series of records to the memory stores, retrieves them and asserts that staleness and confidence metadata are returned.  It also introduces conflicting records to test contradiction suppression.
+- clean workspace
+- contradictory memory retrieval
+- missing required tool arguments
+- unsupported tool request
 
-### Proactivity harness
+It reports per-case outcomes and an overall accuracy score.
 
-The agent is given an opportunity to take a proactive action that is not explicitly requested.  The harness verifies that the meta monitor throttles unnecessary initiative.
+### Memory
 
-### Audit harness
+The memory harness verifies three concrete behaviors:
 
-After running a task, the audit harness reconstructs the run from the logs and snapshots and verifies that the reconstructed state matches the final runtime state.
+- retrieval returns the expected record payload
+- contradiction marking survives conflicting writes on the same subject
+- bounded freshness filtering works through `max_staleness`
 
-These harnesses can be run via the CLI using `hca-eval`.
+### Proactivity
+
+The proactivity harness checks that proactive write actions are gated behind `require_approval`, while benign proactive echo actions are allowed to proceed.
+
+### Embodiment
+
+The embodiment harness runs an approval-gated `write_artifact` scenario and verifies that:
+
+- the selected action is `write_artifact`
+- an artifact record is emitted
+- the artifact file exists on disk
+
+### Audit
+
+The audit harness executes an approval-gated note write, reconstructs the run from events, loads the latest valid snapshot, and checks:
+
+- replay state matches persisted run state
+- replay state matches the latest snapshot
+- selected action is recoverable
+- replay discrepancies are empty
+- episodic memory was written
+
+## CLI Usage
+
+Run a single harness:
+
+```bash
+hca-eval coordination
+```
+
+Run all harnesses with structured output:
+
+```bash
+hca-eval all --json
+```
+
+The CLI returns harness metrics plus per-case details. It is intended for regression checks and contract validation, not statistical model evaluation.

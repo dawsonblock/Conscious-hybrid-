@@ -16,15 +16,53 @@ class ToolReasoner:
 
     def on_broadcast(self, items: List[WorkspaceItem]):
         intent_class = None
+        perceived_arguments = {}
         strategy = None
         critiques: List[str] = []
         for item in items:
             if item.kind == "perceived_intent":
                 intent_class = item.content.get("intent_class")
+                perceived_arguments = item.content.get("arguments", {})
             elif item.kind == "task_plan":
                 strategy = item.content.get("strategy")
             elif item.kind == "action_critique":
                 critiques.extend(item.content.get("critiques", []))
+
+        revised_proposals = []
+        desired_action = None
+        desired_args = {}
+        if intent_class == "store_note":
+            desired_action = "store_note"
+            desired_args = {
+                "note": perceived_arguments.get(
+                    "note", perceived_arguments.get("text", "")
+                )
+            }
+        elif intent_class == "retrieve_memory":
+            desired_action = "echo"
+            desired_args = {
+                "text": (
+                    f"Searching for: {perceived_arguments.get('query')}"
+                )
+            }
+        elif intent_class == "write_artifact":
+            desired_action = "write_artifact"
+            desired_args = dict(perceived_arguments)
+
+        if desired_action and not any(
+            item.kind == "action_suggestion"
+            and item.content.get("action") == desired_action
+            for item in items
+        ):
+            revised_proposals.append(
+                WorkspaceItem(
+                    source_module=self.name,
+                    kind="action_suggestion",
+                    content={"action": desired_action, "args": desired_args},
+                    salience=0.9,
+                    confidence=0.95,
+                )
+            )
 
         adjustments = []
         for item in items:
@@ -77,7 +115,7 @@ class ToolReasoner:
                 )
 
         return {
-            "revised_proposals": [],
+            "revised_proposals": revised_proposals,
             "confidence_adjustments": adjustments,
             "critique_items": [],
         }

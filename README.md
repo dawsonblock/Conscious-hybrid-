@@ -25,6 +25,15 @@ hca-smoke
 
 This will create a new run, execute a simple tool call through the executor, commit the result to memory and print the final state.  You can then replay the run with `hca-replay <run_id>`.
 
+For deterministic regression coverage, run the built-in evaluation harnesses:
+
+```bash
+hca-eval all --json
+pytest
+```
+
+The evaluation CLI exercises coordination, metacognition, memory, proactivity, embodiment and replay/audit behaviors and returns structured metrics for each harness.
+
 ## Limitations
 
 This codebase is a minimal MVP intended as a foundation for further work.  It does **not** include real language models, complex planners or social reasoning.  The modules provided are deterministic stubs.  The runtime currently persists data to the local filesystem only and does not implement robust recovery after process failure.  It is therefore unsuitable for production use without further hardening.
