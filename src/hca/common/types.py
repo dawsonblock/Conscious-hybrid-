@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 
 from hca.common.enums import (
     RuntimeState,
@@ -16,7 +16,10 @@ from hca.common.enums import (
     ControlSignal,
     ReceiptStatus,
 )
-from hca.common.time import utc_now
+from hca.common.time import ensure_utc, utc_now
+
+
+UtcDateTime = Annotated[datetime, AfterValidator(ensure_utc)]
 
 
 class RunContext(BaseModel):
@@ -27,8 +30,8 @@ class RunContext(BaseModel):
     active_environment: Optional[str] = None
     policy_profile: Optional[str] = None
     safety_profile: Optional[str] = None
-    created_at: datetime = Field(default_factory=utc_now)
-    updated_at: datetime = Field(default_factory=utc_now)
+    created_at: UtcDateTime = Field(default_factory=utc_now)
+    updated_at: UtcDateTime = Field(default_factory=utc_now)
     # Runtime state tracking
     state: RuntimeState = RuntimeState.created
     replan_budget: int = 3
@@ -48,7 +51,7 @@ class WorkspaceItem(BaseModel):
     utility_estimate: float = 0.0
     conflict_refs: List[str] = Field(default_factory=list)
     provenance: List[str] = Field(default_factory=list)
-    admitted_at: Optional[datetime] = None
+    admitted_at: Optional[UtcDateTime] = None
     admission_reason: Optional[str] = None
     # Metadata for meta-control
     contradiction_status: bool = False
@@ -96,7 +99,7 @@ class MetaAssessment(BaseModel):
 class MemoryRecord(BaseModel):
     record_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     memory_type: MemoryType
-    run_id: Optional[str] = None # Added run_id for store compatibility
+    run_id: Optional[str] = None  # Added run_id for store compatibility
     subject: Optional[str] = None
     content: Any
     source_run: Optional[str] = None
@@ -105,16 +108,16 @@ class MemoryRecord(BaseModel):
     staleness: float = 0.0
     contradiction_status: bool = False
     retention_policy: Optional[str] = None
-    created_at: datetime = Field(default_factory=utc_now)
-    updated_at: datetime = Field(default_factory=utc_now)
+    created_at: UtcDateTime = Field(default_factory=utc_now)
+    updated_at: UtcDateTime = Field(default_factory=utc_now)
 
 
 class ExecutionReceipt(BaseModel):
     receipt_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     action_id: str
     status: ReceiptStatus
-    started_at: datetime = Field(default_factory=utc_now)
-    finished_at: Optional[datetime] = None
+    started_at: UtcDateTime = Field(default_factory=utc_now)
+    finished_at: Optional[UtcDateTime] = None
     outputs: Optional[Any] = None
     side_effects: Optional[List[str]] = None
     artifacts: Optional[List[str]] = None
@@ -128,8 +131,8 @@ class ApprovalRequest(BaseModel):
     action_id: str
     action_class: ActionClass
     reason: str
-    requested_at: datetime = Field(default_factory=utc_now)
-    expires_at: Optional[datetime] = None
+    requested_at: UtcDateTime = Field(default_factory=utc_now)
+    expires_at: Optional[UtcDateTime] = None
 
 
 class ApprovalDecisionRecord(BaseModel):
@@ -137,23 +140,33 @@ class ApprovalDecisionRecord(BaseModel):
     decision: ApprovalDecision
     actor: str = "user"
     reason: Optional[str] = None
-    decided_at: datetime = Field(default_factory=utc_now)
-    expires_at: Optional[datetime] = None
+    decided_at: UtcDateTime = Field(default_factory=utc_now)
+    expires_at: Optional[UtcDateTime] = None
+
+    @field_validator("decision")
+    @classmethod
+    def _validate_terminal_decision(
+        cls, value: ApprovalDecision
+    ) -> ApprovalDecision:
+        if value == ApprovalDecision.pending:
+            raise ValueError(
+                "ApprovalDecisionRecord must be granted or denied"
+            )
+        return value
 
 
 class ApprovalGrant(BaseModel):
     approval_id: str
-    token: Optional[str] = None # Made optional for denials
-    status: str = "granted" # Added status
-    decision: Optional[ApprovalDecisionRecord] = None # Added decision
-    granted_at: datetime = Field(default_factory=utc_now)
-    expires_at: Optional[datetime] = None
+    token: str
+    actor: str = "user"
+    granted_at: UtcDateTime = Field(default_factory=utc_now)
+    expires_at: Optional[UtcDateTime] = None
 
 
 class ApprovalConsumption(BaseModel):
     approval_id: str
     token: str
-    consumed_at: datetime = Field(default_factory=utc_now)
+    consumed_at: UtcDateTime = Field(default_factory=utc_now)
 
 
 class ArtifactRecord(BaseModel):
@@ -163,7 +176,7 @@ class ArtifactRecord(BaseModel):
     kind: str
     path: str
     metadata: Optional[Dict[str, Any]] = None
-    created_at: datetime = Field(default_factory=utc_now)
+    created_at: UtcDateTime = Field(default_factory=utc_now)
 
 
 class SnapshotRecord(BaseModel):
@@ -174,8 +187,9 @@ class SnapshotRecord(BaseModel):
     memory_summary: Dict[str, int] = Field(default_factory=dict)
     pending_approval: Optional[str] = None
     latest_receipt: Optional[str] = None
-    created_at: datetime = Field(default_factory=utc_now)
+    created_at: UtcDateTime = Field(default_factory=utc_now)
     # Added for v5 compatibility
-    timestamp: datetime = Field(default_factory=utc_now)
+    timestamp: UtcDateTime = Field(default_factory=utc_now)
     workspace_summary: Dict[str, Any] = Field(default_factory=dict)
     pending_approval_id: Optional[str] = None
+    selected_action: Optional[Dict[str, Any]] = None

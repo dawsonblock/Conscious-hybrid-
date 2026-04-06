@@ -2,87 +2,179 @@
 
 from __future__ import annotations
 
-import os
 import uuid
-import json
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import timedelta
+from typing import Any, Dict, Optional
 
-from hca.common.types import (
-    RunContext, 
-    WorkspaceItem, 
-    ModuleProposal, 
-    ActionCandidate, 
-    ExecutionReceipt, 
-    MemoryRecord,
-    ApprovalRequest,
-    ApprovalGrant,
-    ApprovalDecisionRecord,
-    ApprovalConsumption
-)
 from hca.common.enums import (
-    RuntimeState,
+    ActionClass,
+    ControlSignal,
     EventType,
     MemoryType,
-    ActionClass,
-    ApprovalDecision,
-    ControlSignal,
-    ReceiptStatus
+    ReceiptStatus,
+    RuntimeState,
 )
 from hca.common.time import utc_now
+from hca.common.types import (
+    ActionCandidate,
+    ApprovalConsumption,
+    ApprovalRequest,
+    MemoryRecord,
+    RunContext,
+)
+from hca.executor.approvals import validate_resume_approval
+from hca.executor.executor import Executor
+from hca.memory.episodic_store import EpisodicStore
+from hca.meta.monitor import assess
+from hca.modules import Planner, Critic, TextPerception, ToolReasoner
+from hca.prediction.action_scoring import score_actions
+from hca.runtime.snapshots import build_runtime_snapshot
+from hca.runtime.state_machine import assert_transition
 from hca.storage import (
-    save_run,
+    append_consumption as append_approval_consumption,
+    append_denial as append_approval_denial,
     append_event,
     append_snapshot,
-    append_artifact,
-    append_receipt,
-    load_run,
     append_request as append_approval_request,
-    append_decision as append_approval_decision,
-    append_grant as append_approval_grant,
-    append_consumption as append_approval_consumption,
-    resolve_status
+    load_run,
+    save_run,
 )
-from hca.modules import Planner, Critic, TextPerception, ToolReasoner
-from hca.workspace.workspace import Workspace
 from hca.workspace.broadcast import broadcast
 from hca.workspace.recurrence import run_recurrence
-from hca.meta.monitor import assess
-from hca.prediction.action_scoring import score_actions
-from hca.executor.executor import Executor
-from hca.executor.approvals import validate_resume_approval
-from hca.runtime.state_machine import assert_transition
+from hca.workspace.workspace import Workspace
 
 
 class Runtime:
-    def __init__(self, workspace_capacity: int = 7, replan_budget: int = 3) -> None:
+    def __init__(
+        self, workspace_capacity: int = 7, replan_budget: int = 3
+    ) -> None:
         self.workspace_capacity = workspace_capacity
         self.replan_budget = replan_budget
         self._remaining_replan = replan_budget
         self.executor = Executor()
-        self.modules = [Planner(), Critic(), TextPerception(), ToolReasoner()]
+        self.modules: list[Any] = [
+            Planner(),
+            Critic(),
+            TextPerception(),
+            ToolReasoner(),
+        ]
         self._current_state: RuntimeState = RuntimeState.created
         self._execution_failure_count = 0
 
-    def _set_state(self, context: RunContext, target: RuntimeState, payload: Optional[Dict[str, Any]] = None) -> None:
-        """Enforce transition and log event."""
-        assert_transition(self._current_state, target)
-        prior = self._current_state
+    def _persist_context(self, context: RunContext) -> None:
+        context.updated_at = utc_now()
+        save_run(context)
+
+    def _set_state(
+        self,
+        context: RunContext,
+        target: RuntimeState,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Enforce transition, persist it, and log the state change."""
+        current = context.state
+        self._current_state = current
+        assert_transition(current, target)
+        context.state = target
         self._current_state = target
+        self._persist_context(context)
         append_event(
             context,
             EventType.state_transition,
             "runtime",
             payload or {"to": target.value},
-            prior_state=prior,
-            next_state=target
+            prior_state=current,
+            next_state=target,
         )
+
+    def _write_snapshot(
+        self,
+        context: RunContext,
+        workspace: Any,
+        selected_action: Optional[ActionCandidate] = None,
+        latest_receipt_id: Optional[str] = None,
+        promotion_candidates: Optional[list[dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        snapshot = build_runtime_snapshot(
+            run_id=context.run_id,
+            state=context.state,
+            workspace_or_items=workspace,
+            selected_action=selected_action,
+            pending_approval_id=context.pending_approval_id,
+            latest_receipt_id=latest_receipt_id,
+            promotion_candidates=promotion_candidates,
+        )
+        append_snapshot(context.run_id, snapshot)
+        append_event(
+            context,
+            EventType.snapshot_written,
+            "runtime",
+            {
+                "state": snapshot["state"],
+                "pending_approval_id": snapshot.get("pending_approval_id"),
+            },
+        )
+        return snapshot
+
+    def _record_execution_memory(
+        self,
+        context: RunContext,
+        candidate: ActionCandidate,
+        receipt_payload: Dict[str, Any],
+    ) -> None:
+        record = MemoryRecord(
+            memory_type=MemoryType.episodic,
+            run_id=context.run_id,
+            subject=candidate.kind,
+            content={
+                "action_id": candidate.action_id,
+                "action_kind": candidate.kind,
+                "arguments": candidate.arguments,
+                "status": receipt_payload.get("status"),
+                "artifacts": receipt_payload.get("artifacts") or [],
+            },
+            source_run=context.run_id,
+            provenance=[candidate.action_id],
+            confidence=(
+                1.0
+                if receipt_payload.get("status") == ReceiptStatus.success.value
+                else 0.5
+            ),
+        )
+        EpisodicStore(context.run_id).append(record)
+        append_event(
+            context,
+            EventType.memory_written,
+            "runtime",
+            {
+                "record_id": record.record_id,
+                "memory_type": MemoryType.episodic.value,
+                "subject": record.subject,
+            },
+        )
+
+    def _halt_run(self, context: RunContext, reason: str) -> str:
+        append_event(
+            context,
+            EventType.report_emitted,
+            "runtime",
+            {"terminal_state": RuntimeState.halted.value, "reason": reason},
+        )
+        self._set_state(context, RuntimeState.halted, {"reason": reason})
+        self._write_snapshot(context, [], None)
+        return context.run_id
 
     def create_run(self, goal: str, user_id: str | None = None) -> RunContext:
         context = RunContext(goal=goal, user_id=user_id)
         context.active_environment = "default"
-        save_run(context)
-        append_event(context, EventType.run_created, actor="runtime", payload={"goal": goal})
+        context.state = RuntimeState.created
+        self._persist_context(context)
+        append_event(
+            context,
+            EventType.run_created,
+            "runtime",
+            {"goal": goal},
+        )
         return context
 
     def run(self, goal: str, user_id: str | None = None) -> str:
@@ -92,55 +184,79 @@ class Runtime:
         self._execution_failure_count = 0
         return self._step(context)
 
-    def deny_approval(self, run_id: str, approval_id: str, reason: str = "Denied by user") -> str:
-        """Explicitly deny an approval request."""
+    def deny_approval(
+        self, run_id: str, approval_id: str, reason: str = "Denied by user"
+    ) -> str:
         context = load_run(run_id)
         if not context:
             raise ValueError(f"Run {run_id} not found")
-        
-        decision = ApprovalDecisionRecord(
-            approval_id=approval_id,
-            decision=ApprovalDecision.denied,
-            reason=reason
+
+        self._current_state = context.state
+        context.pending_approval_id = approval_id
+        self._persist_context(context)
+        append_approval_denial(run_id, approval_id, reason=reason)
+        append_event(
+            context,
+            EventType.approval_denied,
+            "runtime",
+            {"approval_id": approval_id, "reason": reason},
         )
-        append_approval_decision(run_id, decision)
-        
-        append_event(context, EventType.input_observed, "runtime", {"message": f"Approval {approval_id} denied", "reason": reason})
-        self._set_state(context, RuntimeState.halted, {"reason": f"Approval {approval_id} denied"})
-        return run_id
+        return self._halt_run(
+            context, f"Approval {approval_id} denied: {reason}"
+        )
 
     def resume(self, run_id: str, approval_id: str, token: str) -> str:
         context = load_run(run_id)
         if not context:
             raise ValueError(f"Run {run_id} not found")
-        
-        # Centralized validation
-        v = validate_resume_approval(run_id, approval_id, token)
-        if not v["ok"]:
-            if v["status"] == "denied":
-                self._set_state(context, RuntimeState.halted, {"reason": f"Approval {approval_id} denied"})
-                return run_id
-            elif v["status"] == "expired":
-                self._set_state(context, RuntimeState.failed, {"reason": f"Approval {approval_id} expired"})
-                return run_id
-            raise ValueError(f"Resume validation failed: {v['reason']}")
-            
-        # Record consumption
-        append_approval_consumption(run_id, ApprovalConsumption(approval_id=approval_id, token=token))
-        
-        # Reconstruct selected action
+
+        self._current_state = context.state
+        validation = validate_resume_approval(run_id, approval_id, token)
+        if not validation["ok"]:
+            reason = validation["reason"] or "invalid_approval"
+            status = validation["resolved_status"]
+            if status == "denied":
+                return self._halt_run(
+                    context, f"Approval {approval_id} denied"
+                )
+            if status == "expired":
+                self._set_state(
+                    context,
+                    RuntimeState.failed,
+                    {"reason": reason, "approval_id": approval_id},
+                )
+                self._write_snapshot(context, [], None)
+            raise ValueError(reason.replace("_", " "))
+
+        append_event(
+            context,
+            EventType.approval_granted,
+            "runtime",
+            {"approval_id": approval_id, "token": token},
+        )
+        append_approval_consumption(
+            run_id,
+            ApprovalConsumption(approval_id=approval_id, token=token),
+        )
+        context.pending_approval_id = None
+        self._persist_context(context)
+
         from hca.runtime.replay import reconstruct_state
+
         replayed = reconstruct_state(run_id)
         action_data = replayed.get("selected_action")
-        if not action_data:
-            raise ValueError("Could not reconstruct selected action from events")
-        
+        if not isinstance(action_data, dict):
+            self._set_state(
+                context,
+                RuntimeState.failed,
+                {"reason": "selected_action_unrecoverable"},
+            )
+            self._write_snapshot(context, [], None)
+            raise ValueError(
+                "Could not reconstruct selected action from events"
+            )
+
         candidate = ActionCandidate.model_validate(action_data)
-        
-        # Sync state
-        self._current_state = RuntimeState.awaiting_approval
-        self._set_state(context, RuntimeState.executing, {"approval_id": approval_id})
-        
         return self._execute_and_complete(context, candidate, approved=True)
 
     def _step(self, context: RunContext) -> str:
@@ -150,119 +266,316 @@ class Runtime:
         self._set_state(context, RuntimeState.proposing)
         return self._step_from_proposing(context, workspace)
 
-    def _step_from_proposing(self, context: RunContext, workspace: Workspace) -> str:
-        # Proposing
+    def _step_from_proposing(
+        self, context: RunContext, workspace: Workspace
+    ) -> str:
         for module in self.modules:
             proposal = module.propose(context.run_id)
-            append_event(context, EventType.module_proposed, module.name, proposal.model_dump(mode="json"))
-            
-            # Admitting
-            if self._current_state != RuntimeState.admitting:
+            append_event(
+                context,
+                EventType.module_proposed,
+                module.name,
+                proposal.model_dump(mode="json"),
+            )
+            if context.state != RuntimeState.admitting:
                 self._set_state(context, RuntimeState.admitting)
             workspace.admit(proposal.candidate_items)
 
-        # Broadcasting
         self._set_state(context, RuntimeState.broadcasting)
         broadcast(workspace, self.modules)
-        
-        # Recurrent Update
+
         self._set_state(context, RuntimeState.recurrent_update)
         run_recurrence(workspace, context=context, depth=1)
-        
-        # Action Selection
+
         self._set_state(context, RuntimeState.action_selection)
         assessment = assess(workspace.items)
-        append_event(context, EventType.meta_assessed, "meta", assessment.model_dump(mode="json"))
+        append_event(
+            context,
+            EventType.meta_assessed,
+            "meta",
+            assessment.model_dump(mode="json"),
+        )
 
-        # Meta-control handling
-        sig = assessment.recommended_transition
-        if sig == ControlSignal.halt:
-            self._set_state(context, RuntimeState.halted, {"reason": assessment.explanation})
-            return context.run_id
-        elif sig == ControlSignal.replan:
-            if self._remaining_replan > 0:
-                self._remaining_replan -= 1
-                self._set_state(context, RuntimeState.proposing, {"reason": "replan_signal"})
-                return self._step_from_proposing(context, workspace)
-            else:
-                append_event(context, EventType.input_observed, "runtime", {"message": "replan budget exhausted"})
-        elif sig == ControlSignal.ask_user:
-            self._set_state(context, RuntimeState.awaiting_approval, {"reason": "ask_user_signal", "message": assessment.explanation})
-            append_snapshot(context.run_id, self._build_snapshot(workspace))
-            return context.run_id
-
-        # Selection logic
-        action_candidates = [item for item in workspace.items if item.kind == "action_suggestion"]
+        action_candidates = [
+            item
+            for item in workspace.items
+            if item.kind == "action_suggestion"
+        ]
         if not action_candidates:
-            self._set_state(context, RuntimeState.failed, {"reason": "no_actionable_candidates"})
+            self._set_state(
+                context,
+                RuntimeState.failed,
+                {"reason": "no_actionable_candidates"},
+            )
+            self._write_snapshot(context, workspace)
             return context.run_id
-            
-        cands = []
-        for item in action_candidates:
-            cands.append(ActionCandidate(
+
+        candidates = [
+            ActionCandidate(
                 kind=item.content.get("action"),
                 arguments=item.content.get("args", {}),
-                requires_approval=item.content.get("action") != "echo"
-            ))
-            
-        scored = score_actions(cands)
-        best_candidate, _ = scored[0]
-        append_event(context, EventType.action_selected, "runtime", best_candidate.model_dump(mode="json"))
+                requires_approval=item.content.get("action") != "echo",
+                provenance=item.provenance,
+            )
+            for item in action_candidates
+        ]
+        scored = score_actions(candidates)
+        for candidate, score in scored:
+            append_event(
+                context,
+                EventType.action_scored,
+                "runtime",
+                {
+                    "action_id": candidate.action_id,
+                    "kind": candidate.kind,
+                    "score": score,
+                },
+            )
 
-        # Approval Path
+        signal = assessment.recommended_transition
+        if signal == ControlSignal.halt:
+            return self._halt_run(context, assessment.explanation or "halted")
+        if signal == ControlSignal.replan:
+            if self._remaining_replan > 0:
+                self._remaining_replan -= 1
+                self._set_state(
+                    context,
+                    RuntimeState.proposing,
+                    {
+                        "reason": "replan_signal",
+                        "remaining_replan": self._remaining_replan,
+                    },
+                )
+                return self._step_from_proposing(
+                    context,
+                    Workspace(capacity=self.workspace_capacity),
+                )
+            append_event(
+                context,
+                EventType.report_emitted,
+                "runtime",
+                {"reason_code": "failure_loop", "remaining_replan": 0},
+            )
+        if signal == ControlSignal.retrieve_more:
+            append_event(
+                context,
+                EventType.report_emitted,
+                "runtime",
+                {"reason_code": "retrieve_more", "action": "fallback_replan"},
+            )
+            if self._remaining_replan > 0:
+                self._remaining_replan -= 1
+                self._set_state(
+                    context,
+                    RuntimeState.proposing,
+                    {
+                        "reason": "retrieve_more_signal",
+                        "remaining_replan": self._remaining_replan,
+                    },
+                )
+                return self._step_from_proposing(
+                    context,
+                    Workspace(capacity=self.workspace_capacity),
+                )
+        if signal == ControlSignal.ask_user:
+            append_event(
+                context,
+                EventType.report_emitted,
+                "runtime",
+                {
+                    "reason_code": "ask_user",
+                    "message": assessment.explanation,
+                },
+            )
+            self._set_state(
+                context,
+                RuntimeState.awaiting_approval,
+                {
+                    "reason": "ask_user_signal",
+                    "message": assessment.explanation,
+                },
+            )
+            self._write_snapshot(context, workspace)
+            return context.run_id
+
+        selected_index = 0
+        if signal == ControlSignal.backtrack and len(scored) > 1:
+            selected_index = 1
+            append_event(
+                context,
+                EventType.report_emitted,
+                "runtime",
+                {"reason_code": "backtrack", "selected_rank": 2},
+            )
+
+        best_candidate, _ = scored[selected_index]
+        append_event(
+            context,
+            EventType.action_selected,
+            "runtime",
+            best_candidate.model_dump(mode="json"),
+        )
+
         if best_candidate.requires_approval:
             approval_id = str(uuid.uuid4())
             request = ApprovalRequest(
                 approval_id=approval_id,
                 run_id=context.run_id,
                 action_id=best_candidate.action_id,
-                action_class=ActionClass.medium,
-                reason="Action requires approval"
+                action_class=(
+                    ActionClass.high
+                    if best_candidate.kind == "write_artifact"
+                    else ActionClass.medium
+                ),
+                reason="Action requires approval",
+                expires_at=utc_now() + timedelta(minutes=15),
             )
             append_approval_request(context.run_id, request)
-            append_event(context, EventType.approval_requested, "runtime", {"approval_id": approval_id})
-            
+            context.pending_approval_id = approval_id
+            self._persist_context(context)
+            append_event(
+                context,
+                EventType.approval_requested,
+                "runtime",
+                {
+                    "approval_id": approval_id,
+                    "action_id": best_candidate.action_id,
+                    "action_kind": best_candidate.kind,
+                    "expires_at": (
+                        request.expires_at.isoformat()
+                        if request.expires_at
+                        else None
+                    ),
+                },
+            )
             self._set_state(context, RuntimeState.awaiting_approval)
-            append_snapshot(context.run_id, self._build_snapshot(workspace, best_candidate))
+            self._write_snapshot(
+                context,
+                workspace,
+                selected_action=best_candidate,
+            )
             return context.run_id
 
-        # Direct Execution
-        self._set_state(context, RuntimeState.executing)
-        return self._execute_and_complete(context, best_candidate)
+        context.pending_approval_id = None
+        self._persist_context(context)
+        return self._execute_and_complete(
+            context,
+            best_candidate,
+            approved=False,
+            workspace=workspace,
+        )
 
-    def _execute_and_complete(self, context: RunContext, candidate: ActionCandidate, approved: bool = False) -> str:
-        receipt = self.executor.execute(context.run_id, candidate, approved=approved)
-        append_receipt(context.run_id, receipt)
-        append_event(context, EventType.execution_finished, "executor", receipt.model_dump(mode="json"))
-        
-        # Transition through observing -> memory_commit -> reporting -> completed
+    def _execute_and_complete(
+        self,
+        context: RunContext,
+        candidate: ActionCandidate,
+        approved: bool = False,
+        workspace: Optional[Workspace] = None,
+    ) -> str:
+        if context.state != RuntimeState.executing:
+            self._set_state(
+                context,
+                RuntimeState.executing,
+                {"tool": candidate.kind, "action_id": candidate.action_id},
+            )
+        append_event(
+            context,
+            EventType.execution_started,
+            "executor",
+            {
+                "tool": candidate.kind,
+                "action_id": candidate.action_id,
+                "approved": approved,
+            },
+        )
+
+        receipt = self.executor.execute(
+            context.run_id, candidate, approved=approved
+        )
+        receipt_payload = receipt.model_dump(mode="json")
+        append_event(
+            context,
+            EventType.execution_finished,
+            "executor",
+            receipt_payload,
+        )
+
         self._set_state(context, RuntimeState.observing)
         self._set_state(context, RuntimeState.memory_commit)
+        self._record_execution_memory(context, candidate, receipt_payload)
         self._set_state(context, RuntimeState.reporting)
-        
+        append_event(
+            context,
+            EventType.report_emitted,
+            "runtime",
+            {
+                "action_id": candidate.action_id,
+                "status": receipt.status.value,
+                "failure_count": self._execution_failure_count,
+            },
+        )
+
         if receipt.status == ReceiptStatus.success:
             self._set_state(context, RuntimeState.completed)
+            append_event(
+                context,
+                EventType.run_completed,
+                "runtime",
+                {"receipt_id": receipt.receipt_id},
+            )
         else:
             self._execution_failure_count += 1
+            append_event(
+                context,
+                EventType.report_emitted,
+                "runtime",
+                {
+                    "reason_code": "failure_loop",
+                    "failure_count": self._execution_failure_count,
+                },
+            )
             if self._execution_failure_count > 2:
-                self._set_state(context, RuntimeState.failed, {"reason": "repeated_execution_failures"})
+                self._set_state(
+                    context,
+                    RuntimeState.failed,
+                    {
+                        "reason": "repeated_execution_failures",
+                        "failure_count": self._execution_failure_count,
+                    },
+                )
+                append_event(
+                    context,
+                    EventType.run_failed,
+                    "runtime",
+                    {
+                        "receipt_id": receipt.receipt_id,
+                        "failure_count": self._execution_failure_count,
+                    },
+                )
             else:
-                self._set_state(context, RuntimeState.proposing, {"reason": "execution_failure_retry"})
-                return self._step_from_proposing(context, Workspace(capacity=self.workspace_capacity))
-        
-        append_snapshot(context.run_id, self._build_snapshot(Workspace(capacity=self.workspace_capacity)))
-        return context.run_id
+                self._set_state(
+                    context,
+                    RuntimeState.proposing,
+                    {
+                        "reason": "execution_failure_retry",
+                        "failure_count": self._execution_failure_count,
+                    },
+                )
+                self._write_snapshot(
+                    context,
+                    workspace or [],
+                    selected_action=candidate,
+                    latest_receipt_id=receipt.receipt_id,
+                )
+                return self._step_from_proposing(
+                    context,
+                    Workspace(capacity=self.workspace_capacity),
+                )
 
-    def _build_snapshot(self, workspace: Workspace, selected_action: Optional[ActionCandidate] = None) -> Dict[str, Any]:
-        from hca.common.types import SnapshotRecord
-        snap = SnapshotRecord(
-            run_id="unknown",
-            state=self._current_state,
-            workspace=workspace.items,
-            memory_summary={"episodic": 0},
-            latest_receipt=None
+        self._write_snapshot(
+            context,
+            workspace or [],
+            selected_action=candidate,
+            latest_receipt_id=receipt.receipt_id,
         )
-        data = snap.model_dump(mode="json")
-        if selected_action:
-            data["selected_action"] = selected_action.model_dump(mode="json")
-        return data
+        return context.run_id

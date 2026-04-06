@@ -1,42 +1,53 @@
 """Centralized approval validation for execution."""
 
-from typing import Optional, Tuple, Dict, Any
 from datetime import datetime
+from typing import Any, Dict, Optional
+
 from hca.common.time import utc_now
-from hca.storage.approvals import resolve_status, get_grant, get_consumption, is_expired
+from hca.storage.approvals import get_consumption, get_grant, resolve_status
+
 
 def require_approval(action_class: str) -> bool:
     """Determine if an action class requires approval."""
     return action_class in {"medium", "high"}
 
-def validate_resume_approval(run_id: str, approval_id: str, token: str, now: Optional[datetime] = None) -> Dict[str, Any]:
+
+def validate_resume_approval(
+    run_id: str,
+    approval_id: str,
+    token: str,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
     """Validate if an approval is valid for resumption."""
     now = now or utc_now()
-    status = resolve_status(run_id, approval_id, now)
-    
+    resolved_status = resolve_status(run_id, approval_id, now)
+
     result = {
         "ok": False,
         "reason": None,
-        "status": status
+        "resolved_status": resolved_status,
+        "status": resolved_status,
     }
-    
-    if status == "missing":
+
+    if resolved_status == "missing":
         result["reason"] = "missing_approval"
-    elif status == "denied":
+    elif resolved_status == "denied":
         result["reason"] = "denied_approval"
-    elif status == "expired":
+    elif resolved_status == "expired":
         result["reason"] = "expired_approval"
-    elif status == "consumed":
-        result["reason"] = "already_consumed"
-    elif status == "pending":
-        result["reason"] = "not_yet_granted"
-    elif status == "granted":
+    elif resolved_status == "consumed":
+        result["reason"] = "consumed_token"
+    elif resolved_status == "pending":
+        result["reason"] = "pending_approval"
+    elif resolved_status == "granted":
         grant = get_grant(run_id, approval_id)
         if not grant:
             result["reason"] = "grant_record_missing"
+        elif get_consumption(run_id, approval_id, token=token):
+            result["reason"] = "consumed_token"
         elif grant.token != token:
             result["reason"] = "token_mismatch"
         else:
             result["ok"] = True
-    
+
     return result
