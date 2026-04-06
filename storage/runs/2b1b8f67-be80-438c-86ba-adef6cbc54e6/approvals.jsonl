@@ -1,2 +1,0 @@
-{"record_type": "request", "approval_id": "8751c9b1-3dfe-444f-a5f6-9cf6f79f412e", "run_id": "2b1b8f67-be80-438c-86ba-adef6cbc54e6", "action_id": "307a0553-bbcf-419e-8ec3-660a687fb8ad", "action_class": "medium", "reason": "Action requires approval", "requested_at": "2026-04-06T09:08:07.621307Z", "expires_at": "2026-04-06T09:23:07.621303Z"}
-{"record_type": "decision", "approval_id": "8751c9b1-3dfe-444f-a5f6-9cf6f79f412e", "decision": "denied", "actor": "user", "reason": "User test", "decided_at": "2026-04-06T09:08:07.622172Z", "expires_at": null}

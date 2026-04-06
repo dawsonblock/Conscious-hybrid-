@@ -1,6 +1,7 @@
 import os
 import shutil
-from datetime import timedelta, timezone
+from datetime import timedelta
+
 from hca.common.types import MemoryRecord
 from hca.common.enums import MemoryType
 from hca.common.time import utc_now
@@ -8,9 +9,11 @@ from hca.memory.retrieval import retrieve, calculate_staleness
 from hca.memory.contradiction_check import check_contradictions
 from hca.memory.episodic_store import EpisodicStore
 
+
 def setup_module():
     if os.path.exists("storage/runs/test_memory_v5"):
         shutil.rmtree("storage/runs/test_memory_v5")
+
 
 def test_staleness_logic():
     now = utc_now()
@@ -24,7 +27,8 @@ def test_staleness_logic():
         updated_at=old_time
     )
     staleness = calculate_staleness(rec)
-    assert 0.4 < staleness < 0.6 # 15 days / 30 days = 0.5
+    assert 0.4 < staleness < 0.6
+
 
 def test_contradiction_detection():
     r1 = MemoryRecord(
@@ -39,16 +43,17 @@ def test_contradiction_detection():
         subject="color",
         content={"key": "sky", "value": "red"}
     )
-    
+
     contradictions = check_contradictions(r2, [r1])
-    assert len(contradictions) == 1
-    assert "red" in contradictions[0][1]
-    assert "blue" in contradictions[0][1]
+    assert contradictions.has_contradiction is True
+    assert "red" in (contradictions.reason or "")
+    assert "blue" in (contradictions.reason or "")
+
 
 def test_retrieval_integration():
     run_id = "test_memory_v5"
     store = EpisodicStore(run_id)
-    
+
     # Write two records for same subject but different content
     store.append(MemoryRecord(
         run_id=run_id,
@@ -64,14 +69,15 @@ def test_retrieval_integration():
         content="offline",
         confidence=0.8
     ))
-    
+
     results = retrieve(run_id, "status")
     assert len(results) == 2
     # Both should be marked as contradictory
-    assert results[0].contradiction_status is True
-    assert results[1].contradiction_status is True
+    assert results[0].contradiction is True
+    assert results[1].contradiction is True
     # Sorted by confidence
-    assert results[0].content == "online"
+    assert results[0].record.content == "online"
+
 
 if __name__ == "__main__":
     setup_module()

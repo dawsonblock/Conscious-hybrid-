@@ -15,8 +15,8 @@ def test_workspace_summary():
 
 def test_replan_budget_exhaustion(monkeypatch):
     import hca.runtime.runtime
-    
-    def mock_assess(items):
+
+    def mock_assess(*args, **kwargs):
         return MetaAssessment(
             overall_confidence=1.0,
             recommended_transition=ControlSignal.replan,

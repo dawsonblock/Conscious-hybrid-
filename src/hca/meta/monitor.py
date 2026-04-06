@@ -47,7 +47,10 @@ def _retrieval_flags(
             subject = record.get("subject") or item.get("subject") or "unknown"
             is_contradictory = item.get(
                 "contradiction",
-                record.get("contradiction_status", False),
+                item.get(
+                    "contradiction_status",
+                    record.get("contradiction_status", False),
+                ),
             )
             staleness = item.get("staleness", record.get("staleness", 0.0))
         else:

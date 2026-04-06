@@ -18,6 +18,7 @@ from hca.common.time import utc_now
 from hca.common.types import (
     ActionCandidate,
     ApprovalConsumption,
+    MetaAssessment,
     ApprovalRequest,
     MemoryRecord,
     RunContext,
@@ -171,6 +172,82 @@ class Runtime:
         self._write_snapshot(context, [], None)
         return context.run_id
 
+    def _handle_control_signal(
+        self,
+        context: RunContext,
+        assessment: MetaAssessment,
+    ) -> str | None:
+        signal = assessment.recommended_transition
+        if signal == ControlSignal.halt:
+            return self._halt_run(
+                context, assessment.explanation or "halted"
+            )
+        if signal == ControlSignal.replan:
+            if self._remaining_replan > 0:
+                self._remaining_replan -= 1
+                self._set_state(
+                    context,
+                    RuntimeState.proposing,
+                    {
+                        "reason": "replan_signal",
+                        "remaining_replan": self._remaining_replan,
+                    },
+                )
+                return self._step_from_proposing(
+                    context,
+                    Workspace(capacity=self.workspace_capacity),
+                )
+            append_event(
+                context,
+                EventType.report_emitted,
+                "runtime",
+                {"reason_code": "failure_loop", "remaining_replan": 0},
+            )
+            return None
+        if signal == ControlSignal.retrieve_more:
+            append_event(
+                context,
+                EventType.report_emitted,
+                "runtime",
+                {
+                    "reason_code": "retrieve_more",
+                    "action": "fallback_replan",
+                },
+            )
+            if self._remaining_replan > 0:
+                self._remaining_replan -= 1
+                self._set_state(
+                    context,
+                    RuntimeState.proposing,
+                    {
+                        "reason": "retrieve_more_signal",
+                        "remaining_replan": self._remaining_replan,
+                    },
+                )
+                return self._step_from_proposing(
+                    context,
+                    Workspace(capacity=self.workspace_capacity),
+                )
+            return None
+        if signal == ControlSignal.ask_user:
+            append_event(
+                context,
+                EventType.report_emitted,
+                "runtime",
+                {
+                    "reason_code": "ask_user",
+                    "message": assessment.explanation,
+                },
+            )
+            self._set_state(
+                context,
+                RuntimeState.awaiting_approval,
+                {"reason": assessment.explanation},
+            )
+            self._write_snapshot(context, [], None)
+            return context.run_id
+        return None
+
     def create_run(self, goal: str, user_id: str | None = None) -> RunContext:
         context = RunContext(goal=goal, user_id=user_id)
         context.active_environment = "default"
@@ -314,6 +391,9 @@ class Runtime:
             "meta",
             assessment.model_dump(mode="json"),
         )
+        control_result = self._handle_control_signal(context, assessment)
+        if control_result is not None:
+            return control_result
 
         action_candidates = [
             item
@@ -352,71 +432,6 @@ class Runtime:
             )
 
         signal = assessment.recommended_transition
-        if signal == ControlSignal.halt:
-            return self._halt_run(context, assessment.explanation or "halted")
-        if signal == ControlSignal.replan:
-            if self._remaining_replan > 0:
-                self._remaining_replan -= 1
-                self._set_state(
-                    context,
-                    RuntimeState.proposing,
-                    {
-                        "reason": "replan_signal",
-                        "remaining_replan": self._remaining_replan,
-                    },
-                )
-                return self._step_from_proposing(
-                    context,
-                    Workspace(capacity=self.workspace_capacity),
-                )
-            append_event(
-                context,
-                EventType.report_emitted,
-                "runtime",
-                {"reason_code": "failure_loop", "remaining_replan": 0},
-            )
-        if signal == ControlSignal.retrieve_more:
-            append_event(
-                context,
-                EventType.report_emitted,
-                "runtime",
-                {"reason_code": "retrieve_more", "action": "fallback_replan"},
-            )
-            if self._remaining_replan > 0:
-                self._remaining_replan -= 1
-                self._set_state(
-                    context,
-                    RuntimeState.proposing,
-                    {
-                        "reason": "retrieve_more_signal",
-                        "remaining_replan": self._remaining_replan,
-                    },
-                )
-                return self._step_from_proposing(
-                    context,
-                    Workspace(capacity=self.workspace_capacity),
-                )
-        if signal == ControlSignal.ask_user:
-            append_event(
-                context,
-                EventType.report_emitted,
-                "runtime",
-                {
-                    "reason_code": "ask_user",
-                    "message": assessment.explanation,
-                },
-            )
-            self._set_state(
-                context,
-                RuntimeState.awaiting_approval,
-                {
-                    "reason": "ask_user_signal",
-                    "message": assessment.explanation,
-                },
-            )
-            self._write_snapshot(context, workspace)
-            return context.run_id
-
         selected_index = 0
         if signal == ControlSignal.backtrack and len(scored) > 1:
             selected_index = 1
@@ -505,6 +520,7 @@ class Runtime:
                 "tool": candidate.kind,
                 "action_id": candidate.action_id,
                 "approved": approved,
+                "arguments": candidate.arguments,
             },
         )
 
