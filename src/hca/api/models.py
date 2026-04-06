@@ -1,0 +1,7 @@
+"""API model stubs."""
+
+from pydantic import BaseModel
+
+
+class Empty(BaseModel):
+    pass
