@@ -36,7 +36,7 @@ def validate_resume_approval(
     elif resolved_status == "expired":
         result["reason"] = "expired_approval"
     elif resolved_status == "consumed":
-        result["reason"] = "consumed_token"
+        result["reason"] = "already_consumed"
     elif resolved_status == "pending":
         result["reason"] = "pending_approval"
     elif resolved_status == "granted":
@@ -44,7 +44,7 @@ def validate_resume_approval(
         if not grant:
             result["reason"] = "grant_record_missing"
         elif get_consumption(run_id, approval_id, token=token):
-            result["reason"] = "consumed_token"
+            result["reason"] = "already_consumed"
         elif grant.token != token:
             result["reason"] = "token_mismatch"
         else:

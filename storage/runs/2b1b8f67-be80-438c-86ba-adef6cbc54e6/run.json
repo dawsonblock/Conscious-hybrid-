@@ -1,0 +1,15 @@
+{
+  "run_id": "2b1b8f67-be80-438c-86ba-adef6cbc54e6",
+  "user_id": null,
+  "goal": "remember something",
+  "constraints": null,
+  "active_environment": "default",
+  "policy_profile": null,
+  "safety_profile": null,
+  "created_at": "2026-04-06 09:08:07.619143+00:00",
+  "updated_at": "2026-04-06 09:08:07.622398+00:00",
+  "state": "halted",
+  "replan_budget": 3,
+  "current_replan_count": 0,
+  "pending_approval_id": "8751c9b1-3dfe-444f-a5f6-9cf6f79f412e"
+}

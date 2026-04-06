@@ -112,6 +112,51 @@ class MemoryRecord(BaseModel):
     updated_at: UtcDateTime = Field(default_factory=utc_now)
 
 
+class RetrievalItem(BaseModel):
+    record: MemoryRecord
+    confidence: float
+    staleness: float
+    contradiction: bool = False
+    provenance: List[str] = Field(default_factory=list)
+    memory_type: MemoryType
+
+
+class ContradictionResult(BaseModel):
+    has_contradiction: bool
+    reason: Optional[str] = None
+    subject: Optional[str] = None
+    conflicting_record_ids: List[str] = Field(default_factory=list)
+
+
+class PromotionCandidate(BaseModel):
+    candidate_type: MemoryType
+    subject: Optional[str] = None
+    content: Any = None
+    supporting_record_ids: List[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    support_count: int = 0
+    contradiction_free: bool = True
+
+
+class ConflictRecord(BaseModel):
+    item_ids: List[str] = Field(default_factory=list)
+    reason_code: str
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MissingInfoResult(BaseModel):
+    item_id: str
+    action_kind: str
+    missing_fields: List[str] = Field(default_factory=list)
+
+
+class CapabilitySummary(BaseModel):
+    available_tools: List[str] = Field(default_factory=list)
+    approval_gated_tools: List[str] = Field(default_factory=list)
+    unsupported_requested_actions: List[str] = Field(default_factory=list)
+    failure_count: int = 0
+
+
 class ExecutionReceipt(BaseModel):
     receipt_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     action_id: str

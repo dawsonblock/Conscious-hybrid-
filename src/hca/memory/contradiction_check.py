@@ -1,34 +1,75 @@
 """Logic for detecting contradictions between memory records."""
 
-from typing import List, Dict, Any, Optional, Tuple
-from hca.common.types import MemoryRecord
+from __future__ import annotations
 
-def check_contradictions(new_record: MemoryRecord, existing_records: List[MemoryRecord]) -> List[Tuple[MemoryRecord, str]]:
+from typing import Any, List, Optional
+
+from hca.common.types import ContradictionResult, MemoryRecord
+
+
+def _dict_conflict_reason(
+    subject: str,
+    new_content: dict[str, Any],
+    existing_content: dict[str, Any],
+) -> Optional[str]:
+    shared_keys = sorted(set(new_content) & set(existing_content))
+    for key in shared_keys:
+        if new_content[key] != existing_content[key]:
+            return (
+                f"Conflicting value for subject '{subject}' key '{key}': "
+                f"{new_content[key]!r} vs {existing_content[key]!r}"
+            )
+    return None
+
+
+def _content_conflict_reason(
+    subject: str,
+    new_content: Any,
+    existing_content: Any,
+) -> Optional[str]:
+    if isinstance(new_content, dict) and isinstance(existing_content, dict):
+        return _dict_conflict_reason(subject, new_content, existing_content)
+    if new_content != existing_content:
+        return (
+            f"Different content for subject '{subject}': "
+            f"{new_content!r} vs {existing_content!r}"
+        )
+    return None
+
+
+def check_contradictions(
+    new_record: MemoryRecord,
+    existing_records: List[MemoryRecord],
+) -> ContradictionResult:
     """Check for contradictions between a new record and existing memories."""
-    contradictions = []
-    
-    for existing in existing_records:
-        # Check for same subject but different content
-        if new_record.subject == existing.subject:
-            if isinstance(new_record.content, dict) and isinstance(existing.content, dict):
-                # If they share the same 'key' but have different 'value'
-                if "key" in new_record.content and "key" in existing.content:
-                    if new_record.content["key"] == existing.content["key"]:
-                        if new_record.content.get("value") != existing.content.get("value"):
-                            reason = f"Conflicting value for key '{new_record.content['key']}': '{new_record.content.get('value')}' vs '{existing.content.get('value')}'"
-                            contradictions.append((existing, reason))
-                else:
-                    # Generic dict comparison
-                    for key in new_record.content:
-                        if key in existing.content and new_record.content[key] != existing.content[key]:
-                            reason = f"Conflicting value for key '{key}': '{new_record.content[key]}' vs '{existing.content[key]}'"
-                            contradictions.append((existing, reason))
-            elif new_record.content != existing.content:
-                reason = f"Different content for subject '{new_record.subject}'"
-                contradictions.append((existing, reason))
-                
-    return contradictions
+    subject = new_record.subject
+    if not subject:
+        return ContradictionResult(has_contradiction=False)
 
-def detect_contradictions(existing_records: List[MemoryRecord], new_record: MemoryRecord) -> bool:
+    conflicting_record_ids: List[str] = []
+    reason: Optional[str] = None
+    for existing in existing_records:
+        if existing.subject != subject:
+            continue
+        conflict_reason = _content_conflict_reason(
+            subject,
+            new_record.content,
+            existing.content,
+        )
+        if conflict_reason:
+            conflicting_record_ids.append(existing.record_id)
+            reason = reason or conflict_reason
+
+    return ContradictionResult(
+        has_contradiction=bool(conflicting_record_ids),
+        reason=reason,
+        subject=subject,
+        conflicting_record_ids=conflicting_record_ids,
+    )
+
+
+def detect_contradictions(
+    existing_records: List[MemoryRecord], new_record: MemoryRecord
+) -> bool:
     """Return True if the new record contradicts any existing record."""
-    return len(check_contradictions(new_record, existing_records)) > 0
+    return check_contradictions(new_record, existing_records).has_contradiction

@@ -1,20 +1,41 @@
 """Missing information detector for the workspace."""
 
-from typing import List, Dict, Any, Optional
-from hca.common.types import WorkspaceItem
+from __future__ import annotations
 
-def detect_missing_information(items: List[WorkspaceItem]) -> List[str]:
-    """Identify items in the workspace that are missing required information."""
-    missing = []
-    
-    # Check action suggestions for required args
-    actions = [i for i in items if i.kind == "action_suggestion"]
+from typing import Dict, List
+
+from hca.common.types import MissingInfoResult, WorkspaceItem
+
+
+_REQUIRED_ARGS: Dict[str, List[str]] = {
+    "echo": ["text"],
+    "store_note": ["note"],
+    "write_artifact": ["content"],
+}
+
+
+def detect_missing_information(
+    items: List[WorkspaceItem],
+) -> List[MissingInfoResult]:
+    """Identify action suggestions that are missing required arguments."""
+    missing: List[MissingInfoResult] = []
+    actions = [item for item in items if item.kind == "action_suggestion"]
     for action in actions:
-        kind = action.content.get("action")
+        action_kind = action.content.get("action")
+        if not isinstance(action_kind, str):
+            continue
         args = action.content.get("args", {})
-        
-        # Simple schema-based check
-        if kind == "store_note" and not args.get("note"):
-            missing.append(action.item_id)
-            
+        missing_fields = [
+            field
+            for field in _REQUIRED_ARGS.get(action_kind, [])
+            if not args.get(field)
+        ]
+        if missing_fields:
+            missing.append(
+                MissingInfoResult(
+                    item_id=action.item_id,
+                    action_kind=action_kind,
+                    missing_fields=missing_fields,
+                )
+            )
     return missing

@@ -32,6 +32,7 @@ class ApprovalActionResponse(BaseModel):
     run_id: str
     approval_id: str
     decision: str
+    status: str
     resolved_status: str
     state: str
     reason: Optional[str] = None

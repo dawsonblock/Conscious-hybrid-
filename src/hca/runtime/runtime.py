@@ -26,6 +26,7 @@ from hca.executor.approvals import validate_resume_approval
 from hca.executor.executor import Executor
 from hca.memory.episodic_store import EpisodicStore
 from hca.meta.monitor import assess
+from hca.meta.self_model import capability_summary
 from hca.modules import Planner, Critic, TextPerception, ToolReasoner
 from hca.prediction.action_scoring import score_actions
 from hca.runtime.snapshots import build_runtime_snapshot
@@ -73,6 +74,12 @@ class Runtime:
     ) -> None:
         """Enforce transition, persist it, and log the state change."""
         current = context.state
+        if (
+            current == RuntimeState.created
+            and self._current_state != RuntimeState.created
+        ):
+            current = self._current_state
+            context.state = current
         self._current_state = current
         assert_transition(current, target)
         context.state = target
@@ -285,10 +292,22 @@ class Runtime:
         broadcast(workspace, self.modules)
 
         self._set_state(context, RuntimeState.recurrent_update)
-        run_recurrence(workspace, context=context, depth=1)
+        run_recurrence(
+            workspace,
+            context=context,
+            depth=1,
+            modules=self.modules,
+        )
 
         self._set_state(context, RuntimeState.action_selection)
-        assessment = assess(workspace.items)
+        assessment = assess(
+            workspace.items,
+            failure_count=self._execution_failure_count,
+            capability=capability_summary(
+                workspace.items,
+                failure_count=self._execution_failure_count,
+            ),
+        )
         append_event(
             context,
             EventType.meta_assessed,
@@ -503,19 +522,19 @@ class Runtime:
         self._set_state(context, RuntimeState.observing)
         self._set_state(context, RuntimeState.memory_commit)
         self._record_execution_memory(context, candidate, receipt_payload)
-        self._set_state(context, RuntimeState.reporting)
-        append_event(
-            context,
-            EventType.report_emitted,
-            "runtime",
-            {
-                "action_id": candidate.action_id,
-                "status": receipt.status.value,
-                "failure_count": self._execution_failure_count,
-            },
-        )
 
         if receipt.status == ReceiptStatus.success:
+            self._set_state(context, RuntimeState.reporting)
+            append_event(
+                context,
+                EventType.report_emitted,
+                "runtime",
+                {
+                    "action_id": candidate.action_id,
+                    "status": receipt.status.value,
+                    "failure_count": self._execution_failure_count,
+                },
+            )
             self._set_state(context, RuntimeState.completed)
             append_event(
                 context,
@@ -534,12 +553,57 @@ class Runtime:
                     "failure_count": self._execution_failure_count,
                 },
             )
+            if workspace is None:
+                self._set_state(
+                    context,
+                    RuntimeState.failed,
+                    {
+                        "reason": "execution_failure",
+                        "failure_count": self._execution_failure_count,
+                    },
+                )
+                append_event(
+                    context,
+                    EventType.report_emitted,
+                    "runtime",
+                    {
+                        "action_id": candidate.action_id,
+                        "status": receipt.status.value,
+                        "failure_count": self._execution_failure_count,
+                    },
+                )
+                append_event(
+                    context,
+                    EventType.run_failed,
+                    "runtime",
+                    {
+                        "receipt_id": receipt.receipt_id,
+                        "failure_count": self._execution_failure_count,
+                    },
+                )
+                self._write_snapshot(
+                    context,
+                    [],
+                    selected_action=candidate,
+                    latest_receipt_id=receipt.receipt_id,
+                )
+                return context.run_id
             if self._execution_failure_count > 2:
                 self._set_state(
                     context,
                     RuntimeState.failed,
                     {
                         "reason": "repeated_execution_failures",
+                        "failure_count": self._execution_failure_count,
+                    },
+                )
+                append_event(
+                    context,
+                    EventType.report_emitted,
+                    "runtime",
+                    {
+                        "action_id": candidate.action_id,
+                        "status": receipt.status.value,
                         "failure_count": self._execution_failure_count,
                     },
                 )
@@ -553,6 +617,16 @@ class Runtime:
                     },
                 )
             else:
+                append_event(
+                    context,
+                    EventType.report_emitted,
+                    "runtime",
+                    {
+                        "action_id": candidate.action_id,
+                        "status": receipt.status.value,
+                        "failure_count": self._execution_failure_count,
+                    },
+                )
                 self._set_state(
                     context,
                     RuntimeState.proposing,
